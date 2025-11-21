@@ -245,17 +245,64 @@ We implement a function that advances the gait clock and calculates where the fe
 self.gait_indices[env_ids] = 0
 
 # In Rob6323Go2Env (add new method)
+# Defines contact plan
 def _step_contact_targets(self):
-    frequencies = 3.0
-    # Advance gait phase
+    frequencies = 3.
+    phases = 0.5
+    offsets = 0.
+    bounds = 0.
+    durations = 0.5 * torch.ones((self.num_envs,), dtype=torch.float32, device=self.device)
     self.gait_indices = torch.remainder(self.gait_indices + self.step_dt * frequencies, 1.0)
-    
-    # Calculate clock inputs (sin/cos) for observation
-    # ... (See full implementation in reference code for von mises logic)
-    
-    # Store clock inputs for observation
+
+    foot_indices = [self.gait_indices + phases + offsets + bounds,
+                    self.gait_indices + offsets,
+                    self.gait_indices + bounds,
+                    self.gait_indices + phases]
+
+    self.foot_indices = torch.remainder(torch.cat([foot_indices[i].unsqueeze(1) for i in range(4)], dim=1), 1.0)
+
+    for idxs in foot_indices:
+        stance_idxs = torch.remainder(idxs, 1) < durations
+        swing_idxs = torch.remainder(idxs, 1) > durations
+
+        idxs[stance_idxs] = torch.remainder(idxs[stance_idxs], 1) * (0.5 / durations[stance_idxs])
+        idxs[swing_idxs] = 0.5 + (torch.remainder(idxs[swing_idxs], 1) - durations[swing_idxs]) * (
+                    0.5 / (1 - durations[swing_idxs]))
+
     self.clock_inputs[:, 0] = torch.sin(2 * np.pi * foot_indices[0])
-    # ... (repeat for other feet)
+    self.clock_inputs[:, 1] = torch.sin(2 * np.pi * foot_indices[1])
+    self.clock_inputs[:, 2] = torch.sin(2 * np.pi * foot_indices[2])
+    self.clock_inputs[:, 3] = torch.sin(2 * np.pi * foot_indices[3])
+
+    # von mises distribution
+    kappa = 0.07
+    smoothing_cdf_start = torch.distributions.normal.Normal(0, kappa).cdf  # (x) + torch.distributions.normal.Normal(1, kappa).cdf(x)) / 2
+
+    smoothing_multiplier_FL = (smoothing_cdf_start(torch.remainder(foot_indices[0], 1.0)) * (
+            1 - smoothing_cdf_start(torch.remainder(foot_indices[0], 1.0) - 0.5)) +
+                                smoothing_cdf_start(torch.remainder(foot_indices[0], 1.0) - 1) * (
+                                        1 - smoothing_cdf_start(
+                                    torch.remainder(foot_indices[0], 1.0) - 0.5 - 1)))
+    smoothing_multiplier_FR = (smoothing_cdf_start(torch.remainder(foot_indices[1], 1.0)) * (
+            1 - smoothing_cdf_start(torch.remainder(foot_indices[1], 1.0) - 0.5)) +
+                                smoothing_cdf_start(torch.remainder(foot_indices[1], 1.0) - 1) * (
+                                        1 - smoothing_cdf_start(
+                                    torch.remainder(foot_indices[1], 1.0) - 0.5 - 1)))
+    smoothing_multiplier_RL = (smoothing_cdf_start(torch.remainder(foot_indices[2], 1.0)) * (
+            1 - smoothing_cdf_start(torch.remainder(foot_indices[2], 1.0) - 0.5)) +
+                                smoothing_cdf_start(torch.remainder(foot_indices[2], 1.0) - 1) * (
+                                        1 - smoothing_cdf_start(
+                                    torch.remainder(foot_indices[2], 1.0) - 0.5 - 1)))
+    smoothing_multiplier_RR = (smoothing_cdf_start(torch.remainder(foot_indices[3], 1.0)) * (
+            1 - smoothing_cdf_start(torch.remainder(foot_indices[3], 1.0) - 0.5)) +
+                                smoothing_cdf_start(torch.remainder(foot_indices[3], 1.0) - 1) * (
+                                        1 - smoothing_cdf_start(
+                                    torch.remainder(foot_indices[3], 1.0) - 0.5 - 1)))
+
+    self.desired_contact_states[:, 0] = smoothing_multiplier_FL
+    self.desired_contact_states[:, 1] = smoothing_multiplier_FR
+    self.desired_contact_states[:, 2] = smoothing_multiplier_RL
+    self.desired_contact_states[:, 3] = smoothing_multiplier_RR
 ```
 
 ### 4.5 Implement Raibert Reward
@@ -265,26 +312,38 @@ We calculate the error between where the foot IS and where the Raibert Heuristic
 # In Rob6323Go2Env (add new method)
 
 def _reward_raibert_heuristic(self):
-    # Get current foot positions relative to base
     cur_footsteps_translated = self.foot_positions_w - self.robot.data.root_pos_w.unsqueeze(1)
-    
-    # Transform to body frame
     footsteps_in_body_frame = torch.zeros(self.num_envs, 4, 3, device=self.device)
     for i in range(4):
-        footsteps_in_body_frame[:, i, :] = math_utils.quat_apply_yaw(
-            math_utils.quat_conjugate(self.robot.data.root_quat_w),
-            cur_footsteps_translated[:, i, :]
-        )
+        footsteps_in_body_frame[:, i, :] = math_utils.quat_apply_yaw(math_utils.quat_conjugate(self.robot.data.root_quat_w),
+                                                          cur_footsteps_translated[:, i, :])
 
-    # Calculate Desired Footsteps (Nominal + Offset based on velocity)
-    # offset = phase * velocity * (0.5 / frequency)
-    # ... (See full calculation in reference code)
-    
-    # Calculate Error
+    # nominal positions: [FR, FL, RR, RL]
+    desired_stance_width = 0.25
+    desired_ys_nom = torch.tensor([desired_stance_width / 2, -desired_stance_width / 2, desired_stance_width / 2, -desired_stance_width / 2], device=self.device).unsqueeze(0)
+
+    desired_stance_length = 0.45
+    desired_xs_nom = torch.tensor([desired_stance_length / 2,  desired_stance_length / 2, -desired_stance_length / 2, -desired_stance_length / 2], device=self.device).unsqueeze(0)
+
+    # raibert offsets
+    phases = torch.abs(1.0 - (self.foot_indices * 2.0)) * 1.0 - 0.5
+    frequencies = torch.tensor([3.0], device=self.device)
+    x_vel_des = self._commands[:, 0:1]
+    yaw_vel_des = self._commands[:, 2:3]
+    y_vel_des = yaw_vel_des * desired_stance_length / 2
+    desired_ys_offset = phases * y_vel_des * (0.5 / frequencies.unsqueeze(1))
+    desired_ys_offset[:, 2:4] *= -1
+    desired_xs_offset = phases * x_vel_des * (0.5 / frequencies.unsqueeze(1))
+
+    desired_ys_nom = desired_ys_nom + desired_ys_offset
+    desired_xs_nom = desired_xs_nom + desired_xs_offset
+
+    desired_footsteps_body_frame = torch.cat((desired_xs_nom.unsqueeze(2), desired_ys_nom.unsqueeze(2)), dim=2)
+
     err_raibert_heuristic = torch.abs(desired_footsteps_body_frame - footsteps_in_body_frame[:, :, 0:2])
 
-    # Return squared error (to be minimized)
     reward = torch.sum(torch.square(err_raibert_heuristic), dim=(1, 2))
+
     return reward
 ```
 
